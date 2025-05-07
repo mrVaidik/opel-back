@@ -31,7 +31,7 @@ app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 # Initialize Socket.IO
-socketio = SocketIO(app, async_mode='gevent', cors_allowed_origins='*')
+socketio = SocketIO(app, async_mode='eventlet', cors_allowed_origins='*')
 
 genai.configure(api_key="AIzaSyDtwjdZFSAW1pJSnAj1kURTN8kGeFWmATU")
 
