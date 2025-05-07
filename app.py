@@ -144,11 +144,7 @@ async def process_video(sid, data):
         if processing_resp.get('plan') == "PRO":
             file_size = os.path.getsize(temp_video_path)
             if file_size < max_file_size:
-                ffmpeg_path = os.path.abspath('ffmpeg-2025-03-31-git-35c091f4b7-essentials_build/bin/ffmpeg.exe')
-                if not os.path.isfile(ffmpeg_path):
-                    logger.error(f"FFmpeg executable not found at: {ffmpeg_path}")
-                    return
-
+                ffmpeg_path = 'ffmpeg'  # Adjust this path if ffmpeg is not in PATH
                 command = [ffmpeg_path, '-i', temp_video_path, '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', temp_audio_path]
                 try:
                     result = subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
