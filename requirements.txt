@@ -13,3 +13,5 @@ ffmpeg-python
 Flask
 Flask-CORS 
 Flask-SocketIO 
+gevent
+eventlet
