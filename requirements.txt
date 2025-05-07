@@ -10,3 +10,6 @@ google-generativeai==0.3.0
 wave
 vosk
 ffmpeg-python
+Flask
+Flask-CORS 
+Flask-SocketIO 
