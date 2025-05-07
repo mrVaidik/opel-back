@@ -139,7 +139,7 @@ def process_video(data):
             if processing_resp.get('plan') == "PRO":
                 file_size = os.path.getsize(temp_video_path)
                 if file_size < max_file_size:
-                    ffmpeg_path = os.path.abspath('ffmpeg-2025-03-31-git-35c091f4b7-essentials_build/bin/ffmpeg.exe')
+                    ffmpeg_path = "ffmpeg"
                     if not os.path.isfile(ffmpeg_path):
                         logger.error(f"FFmpeg executable not found at: {ffmpeg_path}")
                         return
