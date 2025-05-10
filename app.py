@@ -102,7 +102,7 @@ async def handle_video_chunks(sid, data):
 async def extract_audio_memory(video_data):
     """Extracts audio from in-memory video data."""
     try:
-        ffmpeg_path = "ffmpeg"  
+        ffmpeg_path = os.environ.get("FFMPEG_PATH", 'ffmpeg')  
         if not os.path.isfile(ffmpeg_path):
             logger.error(f"FFmpeg executable not found at: {ffmpeg_path}")
             return None
