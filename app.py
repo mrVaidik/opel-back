@@ -63,8 +63,8 @@ recorded_chunks = {}
 # Load Vosk model on startup (optional, but can be more efficient)
 vosk_model = None
 try:
-    vosk_model_path = 'vosk-model-en-us-0.22-lgraph'
-    vosk_model = Model(vosk_model_path)
+    
+    vosk_model = Model('vosk-model-en-us-0.42-gigaspeech')
     logger.info("Vosk model loaded successfully.")
 except Exception as e:
     logger.error(f"Error loading Vosk model: {e}")
@@ -102,7 +102,7 @@ async def handle_video_chunks(sid, data):
 async def extract_audio_memory(video_data):
     """Extracts audio from in-memory video data."""
     try:
-        ffmpeg_path = "ffmpeg"  
+        ffmpeg_path = os.path.abspath('ffmpeg-2025-03-31-git-35c091f4b7-essentials_build/bin/ffmpeg.exe')
         if not os.path.isfile(ffmpeg_path):
             logger.error(f"FFmpeg executable not found at: {ffmpeg_path}")
             return None
