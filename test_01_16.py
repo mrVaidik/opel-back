@@ -1,32 +1,38 @@
 import os
 import logging
 import subprocess
-import json
 import re
-import uuid
+import json
 import wave
+import sys
 import aiofiles
 import aiohttp
-from fastapi import FastAPI
+import boto3
+from botocore.config import Config
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+import uvicorn
 from socketio import AsyncServer, ASGIApp
+from vosk import Model, KaldiRecognizer
 from dotenv import load_dotenv
 import google.generativeai as genai
+import ffmpeg
+import uuid  # For generating unique filenames
 from faster_whisper import WhisperModel
 
-# Load environment
-load_dotenv()
 
-# Logging
-logging.basicConfig(level=logging.INFO)
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Create temp directory
-TEMP_DIR = "temp_upload"
-os.makedirs(TEMP_DIR, exist_ok=True)
+# Load environment variables
+load_dotenv()
 
-# FastAPI app and Socket.IO
+# Initialize FastAPI app
 app = FastAPI()
+
+# Configure CORS (as before)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -38,102 +44,224 @@ app.add_middleware(
 sio = AsyncServer(async_mode='asgi', cors_allowed_origins='*')
 socket_app = ASGIApp(socketio_server=sio, other_asgi_app=app)
 
-# Initialize models
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
-whisper_model = WhisperModel("small", device="cpu")
+ 
+genai.configure(api_key=os.getenv(""))
+
+s3 = boto3.client(
+    's3',
+    aws_access_key_id=os.getenv("ACCESS_KEY"),
+    aws_secret_access_key=os.getenv("SECRET_KEY"),
+    region_name=os.getenv("BUCKET_REGION"),
+    config=Config(signature_version='s3v4')
+)
+
+# Create temp_upload directory if it doesn't exist (as before)
+if not os.path.exists('temp_upload'):
+    os.makedirs('temp_upload')
 
 recorded_chunks = {}
 
+print(f"🔄 Loading Whisper model small...")
+model = WhisperModel("small", device="cpu")
+
+# vosk_model = None
+# try:
+#     vosk_model_path = 'vosk-model-en-us-0.22'
+#     vosk_model = Model(vosk_model_path)
+#     logger.info("Vosk model loaded successfully.")
+# except Exception as e:
+#     logger.error(f"Error loading Vosk model: {e}")
+
 @app.get("/test")
-async def test():
+async def test_endpoint():
     return {"status": "ok", "message": "Server is running"}
 
 @sio.on("connect")
-async def on_connect(sid, environ):
-    logger.info(f"Connected: {sid}")
+async def connect(sid, environ):
+    logger.info(f"New client connected: {sid}, IP: {environ.get('REMOTE_ADDR')}, Headers: {environ}")
     recorded_chunks[sid] = []
 
 @sio.on("disconnect")
-async def on_disconnect(sid):
-    logger.info(f"Disconnected: {sid}")
-    recorded_chunks.pop(sid, None)
+async def disconnect(sid):
+    logger.info(f"{sid} disconnected")
+    if sid in recorded_chunks:
+        del recorded_chunks[sid]
 
 @sio.on("video-chunks")
-async def receive_chunks(sid, data):
-    filename = data["filename"]
-    chunks = data["chunks"]
-    if sid not in recorded_chunks:
-        recorded_chunks[sid] = []
-    recorded_chunks[sid].append(chunks)
+async def handle_video_chunks(sid, data):
+    try:
+        filename = data['filename']
+        chunks = data['chunks']
+        if sid not in recorded_chunks:
+            recorded_chunks[sid] = []
+        recorded_chunks[sid].append(chunks)
 
-    temp_path = os.path.join(TEMP_DIR, filename)
-    async with aiofiles.open(temp_path, 'wb') as f:
-        await f.write(b''.join(recorded_chunks[sid]))
-    logger.info(f"Saved chunk: {filename}")
+        temp_file_path = f'temp_upload/{filename}'
+        async with aiofiles.open(temp_file_path, 'wb') as f:
+            await f.write(b''.join(recorded_chunks[sid]))
+        logger.info(f"Chunk received and saved for session {sid}, filename: {filename}")
+    except Exception as e:
+        logger.error(f"Error handling video chunks for session {sid}: {e}")
+        await sio.emit("upload_error", {"message": "Error saving video chunk"}, room=sid)
 
 @sio.on("process-video")
 async def process_video(sid, data):
-    filename = data["filename"]
-    user_id = data["userId"]
-    video_path = os.path.join(TEMP_DIR, filename)
-    audio_filename = f"audio_{uuid.uuid4().hex}.wav"
-    audio_path = os.path.join(TEMP_DIR, audio_filename)
-    max_size = int(os.getenv("MAX_FILE_SIZE", 25_000_000))
+    filename = data['filename']
+    user_id = data['userId']
+    temp_video_path = f'temp_upload/{filename}'
+    unique_audio_filename = f"audio_{uuid.uuid4().hex}.wav"
+    temp_audio_path = f'temp_upload/{unique_audio_filename}'
+    max_file_size = int(os.getenv("MAX_FILE_SIZE", 25000000)) # Get limit from env
 
     try:
-        file_size = os.path.getsize(video_path)
-        if file_size > max_size:
-            logger.warning(f"File too large: {file_size}")
-            return
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{os.getenv('NEXT_API_HOST')}recording/{user_id}/processing",
+                json={"filename": filename}
+            ) as resp:
+                processing_resp = await resp.json()
+                if processing_resp.get('status') != 200:
+                    logger.error(f"Error notifying processing start for user {user_id}: {processing_resp}")
+                    return
 
-        ffmpeg_path = os.path.abspath('ffmpeg/bin/ffmpeg.exe')  # adjust if needed
-        command = [ffmpeg_path, '-i', video_path, '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', audio_path]
-        subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        logger.info(f"Audio extracted: {audio_path}")
+        async with aiofiles.open(temp_video_path, 'rb') as f:
+            file_content = await f.read()
+            response = s3.put_object(
+                Bucket=os.getenv("BUCKET_NAME"),
+                Key=filename,
+                ContentType='video/webm',
+                Body=file_content
+            )
+            if response['ResponseMetadata']['HTTPStatusCode'] == 200:
+                logger.info(f"Video uploaded to AWS for user {user_id}, filename: {filename}")
+            else:
+                logger.error(f"Error uploading video to S3 for user {user_id}, filename: {filename}, status: {response['ResponseMetadata']['HTTPStatusCode']}")
+                return
 
-        segments, _ = whisper_model.transcribe(audio_path)
-        transcription = " ".join([seg.text.strip() for seg in segments]).strip()
+        if processing_resp.get('plan') == "PRO":
+            file_size = os.path.getsize(temp_video_path)
+            if file_size < max_file_size:
+                ffmpeg_path = os.path.abspath('ffmpeg-2025-03-31-git-35c091f4b7-essentials_build/bin/ffmpeg.exe')
+                if not os.path.isfile(ffmpeg_path):
+                    logger.error(f"FFmpeg executable not found at: {ffmpeg_path}")
+                    return
 
-        logger.info(f"Transcription: {transcription}")
-        if transcription:
-            prompt = f"""
-            You are going to generate a title and a nice description using the speech-to-text transcription provided.
-            Transcription:
-            {transcription}
-            Return this JSON:
-            {{
-                "title": "<title>",
-                "summary": "<summary>"
-            }}
-            """
+                command = [ffmpeg_path, '-i', temp_video_path, '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', temp_audio_path]
+                try:
+                    result = subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    logger.info(f"Audio extraction complete for {filename}, audio saved to {temp_audio_path}")
+                except subprocess.CalledProcessError as e:
+                    logger.error(f"Error during audio extraction for {filename}: {e.stderr.decode('utf-8')}")
+                    return
 
-            genai_model = genai.GenerativeModel("gemini-2.0-flash")
-            result = genai_model.generate_content(prompt)
-            content = result.text.strip()
+                if not os.path.exists(temp_audio_path):
+                    logger.error(f"Audio file does not exist at {temp_audio_path} for {filename}")
+                    return
 
-            clean_json = re.sub(r"^```json\s*|\s*```$", "", content.strip(), flags=re.DOTALL)
-            parsed = json.loads(clean_json)
-            logger.info(f"Gemini output: {parsed}")
+                try:
+                        if model:
+                            segments, _ = model.transcribe(temp_audio_path)
+                            full_text = ""
 
-            # You can store `parsed` somewhere or return it
-            await sio.emit("video-processed", {
-                "filename": filename,
-                "transcription": transcription,
-                "title": parsed["title"],
-                "summary": parsed["summary"]
-            }, room=sid)
+                            for segment in segments:
+                                print(f"[{segment.start:.2f}s -> {segment.end:.2f}s] {segment.text}")
+                                full_text += segment.text.strip() + " "
 
+                            transcription = full_text.strip()
+                            logger.info(f"Transcription for {filename}: {transcription}")
+
+                            if transcription:
+                                gemini_prompt = f"""
+                                    You are going to generate a title and a nice description using the speech-to-text transcription provided.
+
+                                    Transcription:
+                                    {transcription}
+
+                                    Return the response in this JSON format:
+                                        {{
+                                            "title": "<generated title>",
+                                            "summary": "<generated summary>"
+                                        }}
+                                    """
+                                try:
+                                    genai_model = genai.GenerativeModel('gemini-2.0-flash')
+                                    gemini_response = genai_model.generate_content(gemini_prompt)
+                                    
+                                    gemini_text = gemini_response.text.strip() # Get text and strip whitespace
+                                    print(gemini_text)
+                                    try:
+                                        gemini_text_clean = re.sub(r"^```json\s*|\s*```$", "", gemini_text.strip(), flags=re.DOTALL).strip()
+                                        gemini_json = json.loads(gemini_text_clean)
+                                        print(gemini_json)
+                                        print("before async")
+                                        async with aiohttp.ClientSession() as session:
+                                            transcribe_resp = await session.post(
+                                                f"{os.getenv('NEXT_API_HOST')}recording/{user_id}/transcribe",
+                                                json={
+                                                    "filename": filename,
+                                                    "content": gemini_json,
+                                                    "transcript": transcription
+                                                }
+                                            )
+                                            print(f"api send : {transcribe_resp}")
+                                            print("file successfully transfer")
+                                            if transcribe_resp.status == 200:
+                                                logger.info(f"Transcription data sent to Next API for {filename}")
+                                            else:
+                                                logger.error(f"Error sending transcription data to Next API for {filename}: {transcribe_resp.status} - {await transcribe_resp.text()}")
+
+                                    except json.JSONDecodeError as e:
+                                        logger.error(f"Error decoding Gemini JSON response for {filename}: {e}, Response text: '{gemini_text}'")
+                                except Exception as e:
+                                    logger.error(f"Error generating content with Gemini for {filename}: {e}")
+                            else:
+                                logger.info(f"No transcription found for {filename}.")
+                        else:
+                            logger.warning("Vosk model not loaded, skipping transcription.")
+                except wave.Error as e:
+                    logger.error(f"Error reading audio file {temp_audio_path} for {filename}: {e}")
+            else:
+                logger.warning(f"File size exceeds the limit ({max_file_size} bytes) for {filename}, skipping transcription.")
+        else:
+            logger.info(f"User {user_id} is not on the 'PRO' plan, skipping transcription for {filename}.")
+    
     except Exception as e:
-        logger.error(f"Processing error: {e}")
-        await sio.emit("processing-error", {"message": str(e)}, room=sid)
-
+        logger.error(f"Error processing video for {filename}: {e}")
     finally:
-        for path in [video_path, audio_path]:
-            if os.path.exists(path):
-                os.remove(path)
-                logger.info(f"Deleted: {path}")
-        recorded_chunks.pop(sid, None)
+        try:
+            async with aiohttp.ClientSession() as session:
+                complete_resp = await session.post(
+                    f"{os.getenv('NEXT_API_HOST')}recording/{user_id}/complete",
+                    json={"filename": filename}
+                )
+                if complete_resp.status == 200:
+                    logger.info(f"Successfully notified completion for {filename}")
+                else:
+                    logger.error(f"Error notifying completion for {filename}: {complete_resp.status} - {await complete_resp.text()}")
+        except Exception as e:
+            logger.error(f"Exception during completion callback for {filename}: {e}")
+
+        if os.path.exists(temp_video_path):
+            os.remove(temp_video_path)
+            logger.info(f"Deleted temporary video file: {temp_video_path}")
+        if os.path.exists(temp_audio_path):
+            os.remove(temp_audio_path)
+            logger.info(f"Deleted temporary audio file: {temp_audio_path}")
+        if sid in recorded_chunks:
+            del recorded_chunks[sid]
+
+    # except Exception as e:
+    #     logger.error(f"Error processing video for {filename}: {e}")
+    # finally:
+    #     # Cleanup temporary files
+    #     if os.path.exists(temp_video_path):
+    #         os.remove(temp_video_path)
+    #         logger.info(f"Deleted temporary video file: {temp_video_path}")
+    #     if os.path.exists(temp_audio_path):
+    #         os.remove(temp_audio_path)
+    #         logger.info(f"Deleted temporary audio file: {temp_audio_path}")
+    #     if sid in recorded_chunks:
+    #         del recorded_chunks[sid]
 
 if __name__ == "__main__":
-    import uvicorn
     uvicorn.run(socket_app, host="0.0.0.0", port=5000)
