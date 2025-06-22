@@ -45,7 +45,7 @@ sio = AsyncServer(async_mode='asgi', cors_allowed_origins='*')
 socket_app = ASGIApp(socketio_server=sio, other_asgi_app=app)
 
  
-genai.configure(api_key=os.getenv(""))
+genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 
 s3 = boto3.client(
     's3',
